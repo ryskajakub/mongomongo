@@ -83,28 +83,32 @@ object MongoMongo {
   }
 
   trait Reader[A, B] {
-    def read(a: => A, doc: Document): B
+    def read(doc: Document): B
   }
 
-  implicit val stringReader = new Reader[Field[String], String] {
-    override def read(a: => Field[String], doc: Document): String = doc.getString(a.name)
+  trait FieldReader[A, B] {
+    def read(a: A, doc: Document): B
   }
-  implicit val intReader = new Reader[Field[Int], Int] {
-    override def read(a: => Field[Int], doc: Document): Int =  {
+
+  implicit val stringReader = new FieldReader[Field[String], String] {
+    override def read(a: Field[String], doc: Document): String = doc.getString(a.name)
+  }
+  implicit val intReader = new FieldReader[Field[Int], Int] {
+    override def read(a: Field[Int], doc: Document): Int = {
       doc.getInteger(a.name).intValue
     }
   }
-  implicit def joinedFieldReader[A,B](implicit rb: Reader[A,B]) = new Reader[JoinedField[A], Seq[B]] {
-    override def read(a: => JoinedField[A], doc: Document): Seq[B] = {
+  implicit def joinedFieldReader[A,B](implicit rb: Reader[A,B]) = new FieldReader[JoinedField[A], Seq[B]] {
+    override def read(a: JoinedField[A], doc: Document): Seq[B] = {
       val array = doc.apply[BsonArray](a.name)
-      val x = array.asScala.map(bson => rb.read(a.elements, bson.asDocument))
+      val x = array.asScala.map(bson => rb.read(bson.asDocument))
       x
     }
   }
 
   def mkReader3[T[_[_]], A, B, C, A1, B1, C1](caseClassTuple: (A1, B1, C1), constructor: (A, B, C) => T[AppLevel])(
-      implicit a: Reader[A1, A], b: Reader[B1, B], c: Reader[C1, C]) = new Reader[T[DbLevel], T[AppLevel]] {
-    override def read(dbLevel: => T[DbLevel], doc: Document): T[AppLevel] = {
+      implicit a: FieldReader[A1, A], b: FieldReader[B1, B], c: FieldReader[C1, C]) = new Reader[T[DbLevel], T[AppLevel]] {
+    override def read(doc: Document): T[AppLevel] = {
       val aa = a.read(caseClassTuple._1, doc)
       val bb = b.read(caseClassTuple._2, doc)
       val cc = c.read(caseClassTuple._3, doc)
@@ -117,14 +121,6 @@ object MongoMongo {
 
   val usage: Query[JoinC] = lookup/*[Company[FlatLevel], Machine[DbLevel], Company[JoinLevel]]*/(
     company, machine, (cp: Company[FlatLevel], jf: JoinedField[Machine[DbLevel]]) => cp.copy[JoinLevel](machines = jf))
-
-  def readMachine(m: Machine[DbLevel]): Machine[AppLevel] = {
-    val bson = Document()
-    val `type` = stringReader.read(m.`type`, bson)
-    val mth = intReader.read(m.mth, bson)
-    val company = intReader.read(m.company, bson)
-    Machine[AppLevel](`type`, mth, company)
-  }
 
 /*
   def read[A, B](q: Query[A])(implicit ev: Reader[A, B]): B = {
@@ -148,7 +144,7 @@ object MongoMongo {
       for {
         result <- results
       } yield {
-        val read = companyReader.read(???, result)
+        val read = companyReader.read(result)
         println(read)
       }
     }
