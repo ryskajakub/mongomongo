@@ -18,9 +18,11 @@ trait MkField {
 
 case class Field[T](name: String)
 
-class JoinField[T]
+case class JoinedField[T](name: String)
 
-case class JoinedField[T](name: String, elements: T)
+case class JoinField[T](name: String) {
+  def join = JoinedField[T](name)
+}
 
 trait DbLevel[TT] extends MkField {
   type T = Field[TT]
@@ -44,9 +46,17 @@ trait AppLevel[TT] extends MkField {
   type A[X] = AppLevel[X]
 }
 
-case class Machine[M[_] <: MkField](`type`: M[String]#T, mth: M[Int]#T, company: M[Int]#T)
+trait Collection {
+  def collectionName: String
+}
 
-case class Company[M[_] <: MkField](id: M[Int]#T, name: M[String]#T, machines: M[Machine[M[Nothing]#A]]#Join)
+case class Machine[M[_] <: MkField](`type`: M[String]#T, mth: M[Int]#T, company: M[Int]#T) extends Collection {
+  def collectionName: String = "machine"
+}
+
+case class Company[M[_] <: MkField](id: M[Int]#T, name: M[String]#T, machines: M[Machine[M[Nothing]#A]]#Join) extends Collection {
+  def collectionName: String = "company"
+}
 
 object MongoMongo {
 
@@ -58,7 +68,7 @@ object MongoMongo {
   type MS = JoinedField[Machine[DbLevel]]
   type JoinC = Company[JoinLevel]
 
-  val company = Company[FlatLevel](Field("id"), Field("name"), new JoinField)
+  val company = Company[FlatLevel](Field("id"), Field("name"), JoinField("machines"))
 
   //val company2 = Company[DbLevel](Field("id"), Field("name"), new JoinedField("no-name", machine))
 
@@ -66,14 +76,15 @@ object MongoMongo {
 
   case class Query[T](bsonCommand: Seq[Bson], dbLevel: T)
 
-  def lookup[C, MS, CC](c: C, ms: MS, copy: (C, JoinedField[MS]) => CC): Query[CC] = {
-    val cc = copy(c, new JoinedField("machines", ms))
+  def lookup[This, That <: Collection, This2, Key](c: This, ms: That, mkJoinedField: This => JoinField[That], mkLocalField: This => Field[Key], mkForeignField: That => Field[Key], copy: (This, JoinedField[That]) => This2): Query[This2] = {
+    val joinedField = mkJoinedField(c).join
+    val cc = copy(c, joinedField)
     val pipeline = Seq(
       Aggregates.lookup(
-        from = "machine",
-        localField = "id",
-        foreignField = "company",
-        as = "machines"
+        from = ms.collectionName,
+        localField = mkLocalField(c).name,
+        foreignField = mkForeignField(ms).name,
+        as = joinedField.name,
       )
     )
     Query(
@@ -120,7 +131,12 @@ object MongoMongo {
     Machine.unapply(machine).get, Machine.apply[AppLevel])
 
   val usage: Query[JoinC] = lookup/*[Company[FlatLevel], Machine[DbLevel], Company[JoinLevel]]*/(
-    company, machine, (cp: Company[FlatLevel], jf: JoinedField[Machine[DbLevel]]) => cp.copy[JoinLevel](machines = jf))
+    company,
+    machine,
+    (cp: Company[FlatLevel]) => cp.machines,
+    (cp: Company[FlatLevel]) => cp.id,
+    (cp: Machine[DbLevel]) => cp.company,
+    (cp: Company[FlatLevel], jf: JoinedField[Machine[DbLevel]]) => cp.copy[JoinLevel](machines = jf))
 
 /*
   def read[A, B](q: Query[A])(implicit ev: Reader[A, B]): B = {
@@ -135,7 +151,7 @@ object MongoMongo {
 
   def runCommand(db: MongoDatabase) = {
     for {
-      results <- db.getCollection("company").aggregate(usage.bsonCommand).toFuture
+      results <- db.getCollection(usage.dbLevel.collectionName).aggregate(usage.bsonCommand).toFuture
     } yield {
 
       println(usage.bsonCommand)
