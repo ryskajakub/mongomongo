@@ -1,0 +1,12 @@
+plugins {
+    id 'scala'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.scala-lang:scala-library:2.12.4'
+    implementation 'org.mongodb.scala:mongo-scala-driver_2.12:2.5.0'
+}
