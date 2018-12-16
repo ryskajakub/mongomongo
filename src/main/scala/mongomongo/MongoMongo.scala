@@ -1,10 +1,10 @@
 package mongomongo
 
 import org.mongodb.scala.MongoDatabase
-import org.mongodb.scala.bson.{BsonArray, BsonDocument}
+import org.mongodb.scala.bson.{BsonArray, BsonDocument, BsonNull}
 import org.mongodb.scala.bson.collection.immutable.Document
 import org.mongodb.scala.bson.conversions.Bson
-import org.mongodb.scala.model.Aggregates
+import org.mongodb.scala.model.{Accumulators, Aggregates, BsonField}
 
 import scala.collection.JavaConverters._
 import scala.concurrent.ExecutionContext.global
@@ -18,11 +18,13 @@ trait MkField {
 
 case class Field[T](name: String)
 
-case class JoinedField[T](name: String)
+case class NestedField[T](name: String)
 
 case class JoinField[T](name: String) {
-  def join = JoinedField[T](name)
+  def join = NestedField[T](name)
 }
+
+case class AccumulatorField[T](name: String)
 
 trait DbLevel[TT] extends MkField {
   type T = Field[TT]
@@ -31,12 +33,16 @@ trait DbLevel[TT] extends MkField {
   type A[X] = DbLevel[X]
 }
 
-trait JoinLevel[TT] extends DbLevel[TT] {
-  type Join = JoinedField[TT]
+trait NestedLevel[TT] extends DbLevel[TT] {
+  type Join = NestedField[TT]
 }
 
-trait FlatLevel[TT] extends DbLevel[TT] {
+trait JoinLevel[TT] extends DbLevel[TT] {
   type Join = JoinField[TT]
+}
+
+trait Accumulators2[TT] extends MkField {
+  type T = AccumulatorField[TT]
 }
 
 trait AppLevel[TT] extends MkField {
@@ -64,11 +70,11 @@ object MongoMongo {
 
   val machine = Machine[DbLevel](Field("type"), Field("mth"), Field("company"))
 
-  type FlatC = Company[FlatLevel]
-  type MS = JoinedField[Machine[DbLevel]]
-  type JoinC = Company[JoinLevel]
+  type FlatC = Company[JoinLevel]
+  type MS = NestedField[Machine[DbLevel]]
+  type JoinC = Company[NestedLevel]
 
-  val company = Company[FlatLevel](Field("id"), Field("name"), JoinField("machines"))
+  val company = Company[JoinLevel](Field("id"), Field("name"), JoinField("machines"))
 
   //val company2 = Company[DbLevel](Field("id"), Field("name"), new JoinedField("no-name", machine))
 
@@ -76,7 +82,38 @@ object MongoMongo {
 
   case class Query[T](bsonCommand: Seq[Bson], dbLevel: T)
 
-  def lookup[This, That <: Collection, This2, Key](c: This, ms: That, mkJoinedField: This => JoinField[That], mkLocalField: This => Field[Key], mkForeignField: That => Field[Key], copy: (This, JoinedField[That]) => This2): Query[This2] = {
+  def mkQuery[A[_[_]], B[_] <: DbLevel[_]](a: A[B]) = Query(Seq.empty, a)
+
+  trait PickAcc[A] {
+    def accs(a: A): Seq[AccumulatorField[_]]
+  }
+
+  def group[T, X, Q](q: Query[T], mkAccumulators: T => X, reader: X => (Q, Seq[BsonField])) : Query[Q] = {
+    val accumulators = mkAccumulators(q.dbLevel)
+    val (q2, bson) = reader(accumulators)
+    val g = Aggregates.group(BsonNull(), bson: _*)
+    Query(q.bsonCommand ++ Seq(g), q2)
+  }
+
+  case class AccTuple[M[_] <: MkField, A, B](_1: M[A]#T, _2:M[B]#T)
+
+  case class Acc[T](field: String, bson: BsonField) {
+    def mkField: Field[T] = Field(field)
+  }
+
+  def sum(t: DbLevel[Int]#T): Acc[DbLevel[Int]#T] = Acc(t.name, Accumulators.sum(t.name, "$" + t.name))
+
+  def first[A](t: DbLevel[A]#T): Acc[DbLevel[A]#T] = Acc(t.name, Accumulators.first(t.name, "$" + t.name))
+
+  val machineQuery = mkQuery[Machine, DbLevel](machine)
+
+  val usageGroup = group(
+    machineQuery,
+    (m: Machine[DbLevel]) => sum(m.mth) -> first(m.`type`),
+    (arg: (Acc[DbLevel[Int]#T], Acc[DbLevel[String]#T])) => (arg._1.mkField -> arg._2.mkField) -> Seq(arg._1.bson, arg._2.bson)
+  )
+
+  def lookup[This, That <: Collection, This2, Key](c: This, ms: That, mkJoinedField: This => JoinField[That], mkLocalField: This => Field[Key], mkForeignField: That => Field[Key], copy: (This, NestedField[That]) => This2): Query[This2] = {
     val joinedField = mkJoinedField(c).join
     val cc = copy(c, joinedField)
     val pipeline = Seq(
@@ -109,8 +146,8 @@ object MongoMongo {
       doc.getInteger(a.name).intValue
     }
   }
-  implicit def joinedFieldReader[A,B](implicit rb: Reader[A,B]) = new FieldReader[JoinedField[A], Seq[B]] {
-    override def read(a: JoinedField[A], doc: Document): Seq[B] = {
+  implicit def joinedFieldReader[A,B](implicit rb: Reader[A,B]) = new FieldReader[NestedField[A], Seq[B]] {
+    override def read(a: NestedField[A], doc: Document): Seq[B] = {
       val array = doc.apply[BsonArray](a.name)
       val x = array.asScala.map(bson => rb.read(bson.asDocument))
       x
@@ -127,41 +164,32 @@ object MongoMongo {
     }
   }
 
-  implicit val machineReader = mkReader3[Machine, String, Int, Int, Field[String], Field[Int], Field[Int]](
+  implicit val machineReader = mkReader3/*[Machine, String, Int, Int, Field[String], Field[Int], Field[Int]]*/(
     Machine.unapply(machine).get, Machine.apply[AppLevel])
 
   val usage: Query[JoinC] = lookup/*[Company[FlatLevel], Machine[DbLevel], Company[JoinLevel]]*/(
     company,
     machine,
-    (cp: Company[FlatLevel]) => cp.machines,
-    (cp: Company[FlatLevel]) => cp.id,
+    (cp: Company[JoinLevel]) => cp.machines,
+    (cp: Company[JoinLevel]) => cp.id,
     (cp: Machine[DbLevel]) => cp.company,
-    (cp: Company[FlatLevel], jf: JoinedField[Machine[DbLevel]]) => cp.copy[JoinLevel](machines = jf))
+    (cp: Company[JoinLevel], jf: NestedField[Machine[DbLevel]]) => cp.copy[NestedLevel](machines = jf))
 
-/*
-  def read[A, B](q: Query[A])(implicit ev: Reader[A, B]): B = {
-    ev.read(q.dbLevel, q.bsonCommand)
-  }
-  */
-
-  //val cAppLevel: Machine[AppLevel] = read(query)
-
-  val companyReader = mkReader3[Company, Int, String, Seq[Machine[AppLevel]], Field[Int], Field[String], JoinedField[Machine[DbLevel]]](
+  val companyReader = mkReader3/*[Company, Int, String, Seq[Machine[AppLevel]], Field[Int], Field[String], NestedField[Machine[DbLevel]]]*/(
     Company.unapply(usage.dbLevel).get, Company.apply[AppLevel])
 
   def runCommand(db: MongoDatabase) = {
     for {
-      results <- db.getCollection(usage.dbLevel.collectionName).aggregate(usage.bsonCommand).toFuture
+      results <- db.getCollection("machine").aggregate(usageGroup.bsonCommand).toFuture
     } yield {
 
-      println(usage.bsonCommand)
+      println(usageGroup.bsonCommand)
       println(results)
 
       for {
         result <- results
       } yield {
-        val read = companyReader.read(result)
-        println(read)
+        println(result)
       }
     }
   }
