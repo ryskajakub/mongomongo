@@ -91,9 +91,24 @@ object MongoMongo {
   type T1[M[_] <: DbLevel[_], A] = Tuple1[M[A]#T]
   type T2[M[_] <: DbLevel[_], A, B] = (M[A]#T, M[B]#T)
 
-  def group[T, X, Q](q: Query[T], mkAccumulators: T => X, reader: X => (Q, Seq[BsonField])) : Query[Q] = {
+  trait Accs[T, U] {
+    def unpack(t: T): (U, Seq[BsonField])
+  }
+
+  implicit def OneAcc[T] = new Accs[Acc[T], Field[T]] {
+    override def unpack(x: Acc[T]): (Field[T], Seq[BsonField]) = x.mkField -> Seq(x.bson)
+  }
+
+  implicit def TwoAcc[T, U] = new Accs[(Acc[T], Acc[U]), (Field[T], Field[U])] {
+    override def unpack(t: (Acc[T], Acc[U])): ((Field[T], Field[U]), Seq[BsonField]) = {
+      (t._1.mkField -> t._2.mkField) -> Seq(t._1.bson, t._2.bson)
+    }
+
+  }
+
+  def group[T, X, Y](q: Query[T], mkAccumulators: T => X)(implicit accs: Accs[X,Y]) : Query[Y] = {
     val accumulators = mkAccumulators(q.dbLevel)
-    val (q2, bson) = reader(accumulators)
+    val (q2, bson) = accs.unpack(accumulators)
     val g = Aggregates.group(BsonNull(), bson: _*)
     Query(q.bsonCommand ++ Seq(g), q2)
   }
@@ -113,7 +128,6 @@ object MongoMongo {
   val usageGroup = group(
     machineQuery,
     (m: Machine[DbLevel]) => sum(m.mth) -> first(m.`type`),
-    (arg: (Acc[Int], Acc[String])) => (arg._1.mkField -> arg._2.mkField) -> Seq(arg._1.bson, arg._2.bson)
   )
 
   def lookup[This, That <: Collection, This2, Key](c: This, ms: That, mkJoinedField: This => JoinField[That], mkLocalField: This => Field[Key], mkForeignField: That => Field[Key], copy: (This, NestedField[That]) => This2): Query[This2] = {
