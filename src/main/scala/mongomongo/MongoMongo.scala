@@ -88,6 +88,9 @@ object MongoMongo {
     def accs(a: A): Seq[AccumulatorField[_]]
   }
 
+  type T1[M[_] <: DbLevel[_], A] = Tuple1[M[A]#T]
+  type T2[M[_] <: DbLevel[_], A, B] = (M[A]#T, M[B]#T)
+
   def group[T, X, Q](q: Query[T], mkAccumulators: T => X, reader: X => (Q, Seq[BsonField])) : Query[Q] = {
     val accumulators = mkAccumulators(q.dbLevel)
     val (q2, bson) = reader(accumulators)
@@ -98,19 +101,19 @@ object MongoMongo {
   case class AccTuple[M[_] <: MkField, A, B](_1: M[A]#T, _2:M[B]#T)
 
   case class Acc[T](field: String, bson: BsonField) {
-    def mkField: Field[T] = Field(field)
+    def mkField: Field[T] = Field[T](field)
   }
 
-  def sum(t: DbLevel[Int]#T): Acc[DbLevel[Int]#T] = Acc(t.name, Accumulators.sum(t.name, "$" + t.name))
+  def sum(t: Field[Int]): Acc[Int] = Acc(t.name, Accumulators.sum(t.name, "$" + t.name))
 
-  def first[A](t: DbLevel[A]#T): Acc[DbLevel[A]#T] = Acc(t.name, Accumulators.first(t.name, "$" + t.name))
+  def first[A](t: Field[A]): Acc[A] = Acc(t.name, Accumulators.first(t.name, "$" + t.name))
 
   val machineQuery = mkQuery[Machine, DbLevel](machine)
 
   val usageGroup = group(
     machineQuery,
     (m: Machine[DbLevel]) => sum(m.mth) -> first(m.`type`),
-    (arg: (Acc[DbLevel[Int]#T], Acc[DbLevel[String]#T])) => (arg._1.mkField -> arg._2.mkField) -> Seq(arg._1.bson, arg._2.bson)
+    (arg: (Acc[Int], Acc[String])) => (arg._1.mkField -> arg._2.mkField) -> Seq(arg._1.bson, arg._2.bson)
   )
 
   def lookup[This, That <: Collection, This2, Key](c: This, ms: That, mkJoinedField: This => JoinField[That], mkLocalField: This => Field[Key], mkForeignField: That => Field[Key], copy: (This, NestedField[That]) => This2): Query[This2] = {
@@ -164,6 +167,16 @@ object MongoMongo {
     }
   }
 
+  implicit def mkReaderT2[A, B](tuple: (Field[A], Field[B]))(
+    implicit a: FieldReader[Field[A], A], b: FieldReader[Field[B], B]) =
+      new Reader[(Field[A], Field[B]), (A, B)] {
+        override def read(doc: Document): (A, B) = {
+          val aa = a.read(tuple._1, doc)
+          val bb = b.read(tuple._2, doc)
+          (aa, bb)
+        }
+      }
+
   implicit val machineReader = mkReader3/*[Machine, String, Int, Int, Field[String], Field[Int], Field[Int]]*/(
     Machine.unapply(machine).get, Machine.apply[AppLevel])
 
@@ -184,12 +197,16 @@ object MongoMongo {
     } yield {
 
       println(usageGroup.bsonCommand)
-      println(results)
+      val reader = mkReaderT2(usageGroup.dbLevel)
 
       for {
         result <- results
       } yield {
-        println(result)
+
+        val read = reader.read(result)
+
+        println(read)
+
       }
     }
   }
