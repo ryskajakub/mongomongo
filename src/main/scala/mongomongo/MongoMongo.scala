@@ -16,13 +16,15 @@ trait MkField {
   type A[M] <: MkField
 }
 
-case class Field[T](name: String)
+case class Field[T](path: String)
 
-case class NestedField[T](name: String)
+case class NestedField[T](path: String)
 
-case class JoinField[T](name: String) {
-  def join = NestedField[T](name)
+case class JoinField[T](path: String) {
+  def join = NestedField[T](path)
 }
+
+object JoinField
 
 case class AccumulatorField[T](name: String)
 
@@ -92,24 +94,35 @@ object MongoMongo {
   type T2[M[_] <: DbLevel[_], A, B] = (M[A]#T, M[B]#T)
 
   trait Accs[T, U] {
-    def unpack(t: T): (U, Seq[BsonField])
+    def unpack(t: T): (U, Seq[BsonField], Document)
   }
 
   implicit def OneAcc[T] = new Accs[Acc[T], Field[T]] {
-    override def unpack(x: Acc[T]): (Field[T], Seq[BsonField]) = x.mkField -> Seq(x.bson)
+    override def unpack(x: Acc[T]): (Field[T], Seq[BsonField], Document) =
+      (x.mkField, Seq(x.bson), Document())
   }
 
-  implicit def TwoAcc[T, U] = new Accs[(Acc[T], Acc[U]), (Field[T], Field[U])] {
-    override def unpack(t: (Acc[T], Acc[U])): ((Field[T], Field[U]), Seq[BsonField]) = {
-      (t._1.mkField -> t._2.mkField) -> Seq(t._1.bson, t._2.bson)
+  implicit def OneGroupId[T] = new Accs[Field[T], Field[T]] {
+    override def unpack(t: Field[T]): (Field[T], Seq[BsonField], Document) = {
+      (Field[T]("_id." + t.path), Seq.empty, Document(t.path -> ("$" + t.path)))
     }
-
   }
 
-  def group[T, X, Y](q: Query[T], mkAccumulators: T => X)(implicit accs: Accs[X,Y]) : Query[Y] = {
+  implicit def TwoAcc[T, TT, U, UU](implicit t: Accs[T, TT], u: Accs[U, UU]) = new Accs[(T, U), (TT, UU)] {
+    override def unpack(x: (T, U)): ((TT, UU), Seq[BsonField], Document) = {
+      val tRe = t.unpack(x._1)
+      val uRe = u.unpack(x._2)
+      ((tRe._1, uRe._1), tRe._2 ++ uRe._2, tRe._3 ++ uRe._3)
+    }
+  }
+
+/*
+  */
+
+  def group[T, Xid, Y](q: Query[T], mkAccumulators: T => Xid)(implicit accs: Accs[Xid,Y]) : Query[Y] = {
     val accumulators = mkAccumulators(q.dbLevel)
-    val (q2, bson) = accs.unpack(accumulators)
-    val g = Aggregates.group(BsonNull(), bson: _*)
+    val (q2, bson, idBson) = accs.unpack(accumulators)
+    val g = Aggregates.group(idBson, bson: _*)
     Query(q.bsonCommand ++ Seq(g), q2)
   }
 
@@ -119,15 +132,15 @@ object MongoMongo {
     def mkField: Field[T] = Field[T](field)
   }
 
-  def sum(t: Field[Int]): Acc[Int] = Acc(t.name, Accumulators.sum(t.name, "$" + t.name))
+  def sum(t: Field[Int]): Acc[Int] = Acc(t.path, Accumulators.sum(t.path, "$" + t.path))
 
-  def first[A](t: Field[A]): Acc[A] = Acc(t.name, Accumulators.first(t.name, "$" + t.name))
+  def first[A](t: Field[A]): Acc[A] = Acc(t.path, Accumulators.first(t.path, "$" + t.path))
 
   val machineQuery = mkQuery[Machine, DbLevel](machine)
 
   val usageGroup = group(
     machineQuery,
-    (m: Machine[DbLevel]) => sum(m.mth) -> first(m.`type`),
+    (m: Machine[DbLevel]) => sum(m.mth) -> m.company //first(m.`type`),
   )
 
   def lookup[This, That <: Collection, This2, Key](c: This, ms: That, mkJoinedField: This => JoinField[That], mkLocalField: This => Field[Key], mkForeignField: That => Field[Key], copy: (This, NestedField[That]) => This2): Query[This2] = {
@@ -136,9 +149,9 @@ object MongoMongo {
     val pipeline = Seq(
       Aggregates.lookup(
         from = ms.collectionName,
-        localField = mkLocalField(c).name,
-        foreignField = mkForeignField(ms).name,
-        as = joinedField.name,
+        localField = mkLocalField(c).path,
+        foreignField = mkForeignField(ms).path,
+        as = joinedField.path,
       )
     )
     Query(
@@ -155,17 +168,26 @@ object MongoMongo {
     def read(a: A, doc: Document): B
   }
 
+  def getLast(path: String, doc: Document): (String, Document) = {
+    val s = path.split('.')
+    if (s.length == 1) s.head -> doc
+    else getLast(s.tail.mkString("."), doc.apply[BsonDocument](s.head))
+  }
+
   implicit val stringReader = new FieldReader[Field[String], String] {
-    override def read(a: Field[String], doc: Document): String = doc.getString(a.name)
+    override def read(a: Field[String], doc: Document): String =
+      doc.getString(a.path)
   }
   implicit val intReader = new FieldReader[Field[Int], Int] {
     override def read(a: Field[Int], doc: Document): Int = {
-      doc.getInteger(a.name).intValue
+      val (s, doc2) = getLast(a.path, doc)
+      doc2.getInteger(s).intValue
+      //doc.getInteger(a.path).intValue
     }
   }
   implicit def joinedFieldReader[A,B](implicit rb: Reader[A,B]) = new FieldReader[NestedField[A], Seq[B]] {
     override def read(a: NestedField[A], doc: Document): Seq[B] = {
-      val array = doc.apply[BsonArray](a.name)
+      val array = doc.apply[BsonArray](a.path)
       val x = array.asScala.map(bson => rb.read(bson.asDocument))
       x
     }
@@ -206,21 +228,16 @@ object MongoMongo {
     Company.unapply(usage.dbLevel).get, Company.apply[AppLevel])
 
   def runCommand(db: MongoDatabase) = {
+    println(usageGroup.bsonCommand)
+    println(usageGroup.dbLevel)
     for {
       results <- db.getCollection("machine").aggregate(usageGroup.bsonCommand).toFuture
     } yield {
-
-      println(usageGroup.bsonCommand)
       val reader = mkReaderT2(usageGroup.dbLevel)
-
       for {
         result <- results
       } yield {
-
-        val read = reader.read(result)
-
-        println(read)
-
+        println(reader.read(result))
       }
     }
   }
