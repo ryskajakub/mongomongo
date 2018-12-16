@@ -116,6 +116,31 @@ object MongoMongo {
     }
   }
 
+  implicit def ThreeAcc[T, TT, U, UU, V, VV](implicit t: Accs[T, TT], u: Accs[U, UU], v: Accs[V, VV]) = new Accs[(T, U, V), (TT, UU, VV)] {
+    override def unpack(x: (T, U, V)): ((TT, UU, VV), Seq[BsonField], Document) = {
+      val tRe = t.unpack(x._1)
+      val uRe = u.unpack(x._2)
+      val vRe = v.unpack(x._3)
+      ((tRe._1, uRe._1, vRe._1), tRe._2 ++ uRe._2 ++ vRe._2, tRe._3 ++ uRe._3 ++ vRe._3)
+    }
+  }
+
+  trait Project[T] {
+    def unpack(t: T): (T, Document)
+  }
+
+  implicit def OneProject[T] = new Project[Field[T]] {
+    override def unpack(t: Field[T]): (Field[T], Document) = t -> Document(t.path -> 1)
+  }
+
+  implicit def TwoProject[T, U](implicit t1: Project[T], u1: Project[U]) = new Project[(T, U)] {
+    override def unpack(t: (T, U)): ((T, U), Document) = {
+      val r1 = t1.unpack(t._1)
+      val r2 = u1.unpack(t._2)
+      (r1._1 -> r2._1) -> (r1._2 ++ r2._2)
+    }
+  }
+
 /*
   */
 
@@ -138,10 +163,19 @@ object MongoMongo {
 
   val machineQuery = mkQuery[Machine, DbLevel](machine)
 
-  val usageGroup = group(
+  val usageGroup1 = group(
     machineQuery,
-    (m: Machine[DbLevel]) => sum(m.mth) -> m.company //first(m.`type`),
+    (m: Machine[DbLevel]) => (sum(m.mth), m.company, first(m.`type`)),
   )
+
+  def project[T, U](q: Query[T], f: T => U)(implicit pro: Project[U]): Query[U] = {
+    val Query(b, d) = q
+    val u = f(d)
+    val projection = pro.unpack(u)
+    Query[U](b ++ Seq(Aggregates.project(projection._2)), projection._1)
+  }
+
+  val usageGroup = project(usageGroup1, (a: (Field[Int], Field[Int], Field[String])) => a._2 -> a._3)
 
   def lookup[This, That <: Collection, This2, Key](c: This, ms: That, mkJoinedField: This => JoinField[That], mkLocalField: This => Field[Key], mkForeignField: That => Field[Key], copy: (This, NestedField[That]) => This2): Query[This2] = {
     val joinedField = mkJoinedField(c).join
